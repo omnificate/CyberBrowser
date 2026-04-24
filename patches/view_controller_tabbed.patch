@@ -1,0 +1,351 @@
+--- a/ios/web/shell/view_controller.mm
++++ b/ios/web/shell/view_controller.mm
+@@ -15,6 +15,7 @@
+ #import "ios/web/public/web_state_delegate_bridge.h"
+ #import "ios/web/public/web_state_observer_bridge.h"
+ #import "ios/web/shell/shell_browser_state.h"
++#import "ios/web/shell/shell_web_client.h"
+ #import "net/base/apple/url_conversions.h"
+ #import "ui/base/page_transition_types.h"
+ 
+@@ -22,6 +23,27 @@ NSString* const kWebShellBackButtonAccessibilityLabel = @"Back";
+ NSString* const kWebShellForwardButtonAccessibilityLabel = @"Forward";
+ NSString* const kWebShellAddressFieldAccessibilityLabel = @"Address field";
+ 
++// CyberBrowser: History storage helper
++static void StoreHistoryItem(NSString *url, NSString *title) {
++  if (!url || url.length == 0) return;
++  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
++  NSMutableArray *history = [NSMutableArray arrayWithArray:[defaults arrayForKey:@"cyberbrowser_history"] ?: @[]];
++  
++  NSMutableIndexSet *toRemove = [NSMutableIndexSet indexSet];
++  for (NSUInteger i = 0; i < history.count; i++) {
++    NSDictionary *item = history[i];
++    if ([item[@"url"] isEqualToString:url]) [toRemove addIndex:i];
++  }
++  [history removeObjectsAtIndexes:toRemove];
++  
++  NSDictionary *item = @{@"url": url, @"title": title ?: url, @"date": [NSDate date]};
++  [history insertObject:item atIndex:0];
++  if (history.count > 500) [history removeObjectsInRange:NSMakeRange(500, history.count - 500)];
++  
++  [defaults setObject:history forKey:@"cyberbrowser_history"];
++  [defaults synchronize];
++}
++
+ using web::NavigationManager;
+ 
+ @interface ViewController () <CRWWebStateDelegate,
+@@ -34,7 +56,12 @@
+   std::unique_ptr<web::WebStateObserverBridge> _webStateObserver;
+   std::unique_ptr<web::WebStateDelegateBridge> _webStateDelegate;
+ }
++
+ @property(nonatomic, assign, readonly) NavigationManager* navigationManager;
+ @property(nonatomic, readwrite, strong) UITextField* field;
++
++// CyberBrowser additions
++@property(nonatomic, strong) UIProgressView* progressView;
++@property(nonatomic, strong) UIBarButtonItem* tabsButton;
++@property(nonatomic, strong) UIBarButtonItem* historyButton;
+ @end
+ 
+ @implementation ViewController
+@@ -59,6 +86,15 @@
+   _toolbarView.delegate = self;
+   [self.view addSubview:_toolbarView];
+ 
++  // CyberBrowser: Progress bar at top
++  self.progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
++  self.progressView.frame = CGRectMake(0, 0, CGRectGetWidth(bounds), 2);
++  self.progressView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
++  self.progressView.tintColor = [UIColor systemBlueColor];
++  self.progressView.hidden = YES;
++  [self.view addSubview:self.progressView];
++
++  _toolbarView.frame = CGRectMake(0, 2, CGRectGetWidth(bounds), 42);
++
+   // Set up the container view.
+   _containerView = [[UIView alloc] init];
+   _containerView.frame =
+@@ -68,23 +104,36 @@
+       UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+   [self.view addSubview:_containerView];
+ 
+-  // Set up the toolbar buttons.
++  // CyberBrowser: Updated toolbar with tabs and history
+   UIBarButtonItem* back = [[UIBarButtonItem alloc]
+-      initWithImage:[UIImage imageNamed:@"toolbar_back"]
++      initWithImage:[UIImage systemImageNamed:@"chevron.backward"]
+               style:UIBarButtonItemStylePlain
+              target:self
+              action:@selector(back)];
+   [back setAccessibilityLabel:kWebShellBackButtonAccessibilityLabel];
+ 
+   UIBarButtonItem* forward = [[UIBarButtonItem alloc]
+-      initWithImage:[UIImage imageNamed:@"toolbar_forward"]
++      initWithImage:[UIImage systemImageNamed:@"chevron.forward"]
+               style:UIBarButtonItemStylePlain
+              target:self
+              action:@selector(forward)];
+   [forward setAccessibilityLabel:kWebShellForwardButtonAccessibilityLabel];
+ 
++  UIBarButtonItem* reload = [[UIBarButtonItem alloc]
++      initWithImage:[UIImage systemImageNamed:@"arrow.clockwise"]
++              style:UIBarButtonItemStylePlain
++             target:self
++             action:@selector(doReload)];
++
++  self.tabsButton = [[UIBarButtonItem alloc]
++      initWithTitle:@"1"
++              style:UIBarButtonItemStylePlain
++             target:self
++             action:@selector(showTabs)];
++
++  self.historyButton = [[UIBarButtonItem alloc]
++      initWithImage:[UIImage systemImageNamed:@"clock"]
++              style:UIBarButtonItemStylePlain
++             target:self
++             action:@selector(showHistory)];
++
+   UITextField* field = [[UITextField alloc]
+-      initWithFrame:CGRectMake(88, 6, CGRectGetWidth([_toolbarView frame]) - 98,
+-                               31)];
++      initWithFrame:CGRectMake(88, 6, CGRectGetWidth([_toolbarView frame]) - 250, 31)];
+   [field setDelegate:self];
+-  [field setBackground:[[UIImage imageNamed:@"textfield_background"]
+-                           resizableImageWithCapInsets:UIEdgeInsetsMake(
+-                                                           12, 12, 12, 12)]];
++  [field setBackgroundColor:[UIColor tertiarySystemBackgroundColor]];
++  field.layer.cornerRadius = 6;
+   [field setAutoresizingMask:UIViewAutoresizingFlexibleWidth];
+   [field setKeyboardType:UIKeyboardTypeWebSearch];
+   [field setAutocorrectionType:UITextAutocorrectionTypeNo];
+@@ -92,7 +141,12 @@
+   [field setClearButtonMode:UITextFieldViewModeWhileEditing];
+   self.field = field;
+ 
+   [_toolbarView setItems:@[
+-    back, forward, [[UIBarButtonItem alloc] initWithCustomView:field]
++    back, forward, reload,
++    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil],
++    [[UIBarButtonItem alloc] initWithCustomView:field],
++    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil],
++    self.tabsButton,
++    self.historyButton
+   ]];
+ 
+   web::ShellWebClient* client =
+@@ -156,6 +210,11 @@
+   }
+ }
+ 
++- (void)doReload {
++  self.navigationManager->Reload(ReloadType::NORMAL, false);
++}
++
+ - (BOOL)textFieldShouldReturn:(UITextField*)field {
+   GURL URL = GURL(base::SysNSStringToUTF8([field text]));
+ 
+@@ -163,6 +222,15 @@
+   if (URL.is_valid()) {
+     NavigationManager::WebLoadParams params(URL);
+     params.transition_type = ui::PAGE_TRANSITION_TYPED;
++    self.navigationManager->LoadURLWithParams(params);
++  } else {
++    // CyberBrowser: Google search for invalid URLs
++    NSString *encoded = [[field text] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
++    NSString *searchURL = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encoded];
++    GURL gurl([searchURL UTF8String]);
++    NavigationManager::WebLoadParams params(gurl);
++    params.transition_type = ui::PAGE_TRANSITION_GENERATED;
+     self.navigationManager->LoadURLWithParams(params);
+   }
+ 
+@@ -178,22 +246,17 @@
+     return;
+   }
+ 
+-  const GURL& visibleURL = _webState->GetVisibleURL();
+-  [_field setText:base::SysUTF8ToNSString(visibleURL.spec())];
+-}
+-
+-// -----------------------------------------------------------------------
+-#pragma mark Bikeshedding Implementation
+-
+-// Overridden to allow this view controller to receive motion events by being
+-// first responder when no other views are.
+-- (BOOL)canBecomeFirstResponder {
+-  return YES;
+-}
+-
+-- (void)motionEnded:(UIEventSubtype)motion withEvent:(UIEvent*)event {
+-  if (event.subtype == UIEventSubtypeMotionShake) {
+-    [self updateToolbarColor];
++  // CyberBrowser: Update address bar and history
++  const GURL& visibleURL = _webState->GetVisibleURL();
++  NSString *urlStr = base::SysUTF8ToNSString(visibleURL.spec());
++  [_field setText:urlStr];
++  
++  // Store history when not loading
++  if (!_webState->IsLoading() && visibleURL.is_valid()) {
++    const std::u16string &title = _webState->GetTitle();
++    NSString *titleStr = title.empty() ? nil : [NSString stringWithCharacters:(const unichar *)title.data() length:title.length()];
++    StoreHistoryItem(urlStr, titleStr);
+   }
+ }
+ 
+@@ -201,30 +264,6 @@
+ // WebStateObserver implementation.
+ 
+ - (void)webState:(web::WebState*)webState
+-    didStartNavigation:(web::NavigationContext*)navigation {
+-  [self updateToolbar];
+-}
+-
+-- (void)webState:(web::WebState*)webState
+-    didFinishNavigation:(web::NavigationContext*)navigation {
+-  [self updateToolbar];
+-}
+-
+-- (void)webState:(web::WebState*)webState didLoadPageWithSuccess:(BOOL)success {
+-  DCHECK_EQ(_webState.get(), webState);
+-  [self updateToolbar];
+-}
+-
+-// -----------------------------------------------------------------------
+-// WebStateDelegate implementation.
+-
+-- (void)webState:(web::WebState*)webView
+-    contextMenuConfigurationForParams:(const web::ContextMenuParams&)params
+-                    completionHandler:(void (^)(UIContextMenuConfiguration*))
+-                                          completionHandler {
+-  GURL link = params.link_url;
+-  void (^copyHandler)(UIAction*) = ^(UIAction* action) {
+-    NSDictionary* item = @{
+-      UTTypeURL.identifier : net::NSURLWithGURL(link),
+-      UTTypeUTF8PlainText.identifier : [base::SysUTF8ToNSString(link.spec())
+-          dataUsingEncoding:NSUTF8StringEncoding],
+-    };
+-    [[UIPasteboard generalPasteboard] setItems:@[ item ]];
+-  };
+-
+-  UIContextMenuConfiguration* configuration = [UIContextMenuConfiguration
+-      configurationWithIdentifier:nil
+-      previewProvider:^{
+-        UIViewController* controller = [[UIViewController alloc] init];
+-        CGRect frame = CGRectMake(10, 200, 200, 21);
+-        UILabel* label = [[UILabel alloc] initWithFrame:frame];
+-        label.text = @"iOS13 Preview Page";
+-        [controller.view addSubview:label];
+-        return controller;
+-      }
+-      actionProvider:^(id _) {
+-        NSArray* actions = @[
+-          [UIAction actionWithTitle:@"Copy Link"
+-                              image:nil
+-                         identifier:nil
+-                            handler:copyHandler],
+-          [UIAction actionWithTitle:@"Cancel"
+-                              image:nil
+-                         identifier:nil
+-                            handler:^(id ignored){
+-                            }]
+-        ];
+-        NSString* menuTitle = [NSString
+-            stringWithFormat:@"iOS13 Context Menu: %s", link.spec().c_str()];
+-        return [UIMenu menuWithTitle:menuTitle children:actions];
+-      }];
+-
+-  completionHandler(configuration);
+-}
+-
+-- (void)webStateDestroyed:(web::WebState*)webState {
+-  // The WebState is owned by the current instance, and the observer bridge
+-  // is unregistered before the WebState is destroyed, so this event should
+-  // never happen.
+-  NOTREACHED();
+-}
+-
+-@end
++    didStartNavigation:(web::NavigationContext*)navigation {
++  [self updateToolbar];
++  self.progressView.hidden = NO;
++}
++
++- (void)webState:(web::WebState*)webState
++    didFinishNavigation:(web::NavigationContext*)navigation {
++  [self updateToolbar];
++  self.progressView.hidden = YES;
++  self.progressView.progress = 1.0;
++}
++
++- (void)webState:(web::WebState*)webState didLoadPageWithSuccess:(BOOL)success {
++  DCHECK_EQ(_webState.get(), webState);
++  [self updateToolbar];
++  self.progressView.hidden = YES;
++}
++
++- (void)webState:(web::WebState*)webState
++    loadProgressChanged:(double)progress {
++  self.progressView.progress = progress;
++  self.progressView.hidden = NO;
++}
++
++// -----------------------------------------------------------------------
++// CyberBrowser: Tabs and History actions
++
++- (void)showTabs {
++  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"CyberBrowser"
++                                                                    message:@"Tab management: Use the address bar to navigate to new pages."
++                                                             preferredStyle:UIAlertControllerStyleAlert];
++  [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
++  [self presentViewController:alert animated:YES completion:nil];
++}
++
++- (void)showHistory {
++  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
++  NSArray *history = [defaults arrayForKey:@"cyberbrowser_history"] ?: @[];
++  
++  UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"History (%lu)", (unsigned long)history.count]
++                                                                    message:nil
++                                                             preferredStyle:UIAlertControllerStyleActionSheet];
++  
++  for (NSDictionary *item in history) {
++    NSString *title = item[@"title"] ?: item[@"url"] ?: @"Unknown";
++    NSString *url = item[@"url"] ?: @"";
++    
++    [alert addAction:[UIAlertAction actionWithTitle:title
++                                              style:UIAlertActionStyleDefault
++                                            handler:^(UIAlertAction *action) {
++      GURL gurl([url UTF8String]);
++      if (gurl.is_valid()) {
++        NavigationManager::WebLoadParams params(gurl);
++        params.transition_type = ui::PAGE_TRANSITION_TYPED;
++        self.navigationManager->LoadURLWithParams(params);
++      }
++    }]];
++  }
++  
++  [alert addAction:[UIAlertAction actionWithTitle:@"Clear History"
++                                            style:UIAlertActionStyleDestructive
++                                          handler:^(UIAlertAction *action) {
++    [defaults removeObjectForKey:@"cyberbrowser_history"];
++    [defaults synchronize];
++  }]];
++  
++  [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
++                                            style:UIAlertActionStyleCancel
++                                          handler:nil]];
++  
++  [self presentViewController:alert animated:YES completion:nil];
++}
++
++// -----------------------------------------------------------------------
++// WebStateDelegate implementation (minimal).
++
++- (void)webStateDestroyed:(web::WebState*)webState {
++  NOTREACHED();
++}
++
++@end

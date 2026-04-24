@@ -1,0 +1,426 @@
+// CyberBrowserViewController.mm
+// Replaces ios/web/shell/view_controller.mm with custom tabbed browser UI
+// This file is copied into the Chromium source tree during build
+
+#import "ios/web/shell/view_controller.h"
+
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <stdint.h>
+
+#import <memory>
+#import <utility>
+
+#import "base/memory/raw_ptr.h"
+#import "base/strings/sys_string_conversions.h"
+#import "ios/web/public/navigation/navigation_manager.h"
+#import "ios/web/public/navigation/referrer.h"
+#import "ios/web/public/ui/context_menu_params.h"
+#import "ios/web/public/web_state.h"
+#import "ios/web/public/web_state_delegate_bridge.h"
+#import "ios/web/public/web_state_observer_bridge.h"
+#import "ios/web/shell/shell_browser_state.h"
+#import "ios/web/shell/shell_web_client.h"
+#import "net/base/apple/url_conversions.h"
+#import "ui/base/page_transition_types.h"
+
+// Store history in NSUserDefaults
+static void StoreHistoryItem(NSString *url, NSString *title) {
+  if (!url || url.length == 0) return;
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  NSMutableArray *history = [NSMutableArray arrayWithArray:[defaults arrayForKey:@"cyberbrowser_history"] ?: @[]];
+  
+  // Deduplicate
+  NSMutableIndexSet *toRemove = [NSMutableIndexSet indexSet];
+  for (NSUInteger i = 0; i < history.count; i++) {
+    NSDictionary *item = history[i];
+    if ([item[@"url"] isEqualToString:url]) [toRemove addIndex:i];
+  }
+  [history removeObjectsAtIndexes:toRemove];
+  
+  NSDictionary *item = @{@"url": url, @"title": title ?: url, @"date": [NSDate date]};
+  [history insertObject:item atIndex:0];
+  if (history.count > 500) [history removeObjectsInRange:NSMakeRange(500, history.count - 500)];
+  
+  [defaults setObject:history forKey:@"cyberbrowser_history"];
+  [defaults synchronize];
+}
+
+NSString* const kWebShellBackButtonAccessibilityLabel = @"Back";
+NSString* const kWebShellForwardButtonAccessibilityLabel = @"Forward";
+NSString* const kWebShellAddressFieldAccessibilityLabel = @"Address field";
+
+using web::NavigationManager;
+
+@interface ViewController () <CRWWebStateDelegate,
+                              CRWWebStateObserver,
+                              UITextFieldDelegate,
+                              UIToolbarDelegate> {
+  raw_ptr<web::BrowserState> _browserState;
+  std::unique_ptr<web::WebState> _webState;
+  std::unique_ptr<web::WebStateObserverBridge> _webStateObserver;
+  std::unique_ptr<web::WebStateDelegateBridge> _webStateDelegate;
+}
+
+// CyberBrowser additions
+@property(nonatomic, strong) UIProgressView* progressView;
+@property(nonatomic, strong) UIBarButtonItem* tabsButton;
+@property(nonatomic, strong) UIBarButtonItem* historyButton;
+@property(nonatomic, readwrite) web::WebState* webState;
+
+@end
+
+@implementation ViewController
+
+@synthesize field = _field;
+@synthesize containerView = _containerView;
+@synthesize toolbarView = _toolbarView;
+@synthesize webState = _webState;
+
+- (void)dealloc {
+  if (_webState) {
+    _webState->RemoveObserver(_webStateObserver.get());
+    _webStateObserver.reset();
+    _webState.reset();
+  }
+}
+
+- (void)viewDidLoad {
+  [super viewDidLoad];
+
+  CGRect bounds = self.view.bounds;
+
+  // Set up the toolbar.
+  _toolbarView = [[UIToolbar alloc] init];
+  _toolbarView.barTintColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.1 alpha:1.0];
+  _toolbarView.frame = CGRectMake(0, 0, CGRectGetWidth(bounds), 44);
+  _toolbarView.autoresizingMask =
+      UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
+  _toolbarView.delegate = self;
+  [self.view addSubview:_toolbarView];
+
+  // Progress bar at top of toolbar
+  self.progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+  self.progressView.frame = CGRectMake(0, 0, CGRectGetWidth(bounds), 2);
+  self.progressView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+  self.progressView.tintColor = [UIColor systemBlueColor];
+  self.progressView.hidden = YES;
+  [self.view addSubview:self.progressView];
+
+  // Set up the container view.
+  _containerView = [[UIView alloc] init];
+  _containerView.frame =
+      CGRectMake(0, 44, CGRectGetWidth(bounds), CGRectGetHeight(bounds) - 44);
+  _containerView.backgroundColor = [UIColor lightGrayColor];
+  _containerView.autoresizingMask =
+      UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+  [self.view addSubview:_containerView];
+
+  // Set up the toolbar buttons.
+  UIBarButtonItem* back = [[UIBarButtonItem alloc]
+      initWithImage:[UIImage systemImageNamed:@"chevron.backward"]
+              style:UIBarButtonItemStylePlain
+             target:self
+             action:@selector(back)];
+  [back setAccessibilityLabel:kWebShellBackButtonAccessibilityLabel];
+
+  UIBarButtonItem* forward = [[UIBarButtonItem alloc]
+      initWithImage:[UIImage systemImageNamed:@"chevron.forward"]
+              style:UIBarButtonItemStylePlain
+             target:self
+             action:@selector(forward)];
+  [forward setAccessibilityLabel:kWebShellForwardButtonAccessibilityLabel];
+
+  // Tabs button
+  self.tabsButton = [[UIBarButtonItem alloc]
+      initWithTitle:@"1"
+              style:UIBarButtonItemStylePlain
+             target:self
+             action:@selector(showTabs)];
+
+  // History button
+  self.historyButton = [[UIBarButtonItem alloc]
+      initWithImage:[UIImage systemImageNamed:@"clock"]
+              style:UIBarButtonItemStylePlain
+             target:self
+             action:@selector(showHistory)];
+
+  // Reload button
+  UIBarButtonItem* reload = [[UIBarButtonItem alloc]
+      initWithImage:[UIImage systemImageNamed:@"arrow.clockwise"]
+              style:UIBarButtonItemStylePlain
+             target:self
+             action:@selector(reload)];
+
+  UITextField* field = [[UITextField alloc]
+      initWithFrame:CGRectMake(88, 6, CGRectGetWidth([_toolbarView frame]) - 200, 31)];
+  [field setDelegate:self];
+  [field setBackground:[[UIImage systemImageNamed:@"textfield_background"]
+                           resizableImageWithCapInsets:UIEdgeInsetsMake(
+                                                           12, 12, 12, 12)] ?: [[UIImage alloc] init]];
+  [field setAutoresizingMask:UIViewAutoresizingFlexibleWidth];
+  [field setKeyboardType:UIKeyboardTypeWebSearch];
+  [field setAutocorrectionType:UITextAutocorrectionTypeNo];
+  [field setAccessibilityLabel:kWebShellAddressFieldAccessibilityLabel];
+  [field setClearButtonMode:UITextFieldViewModeWhileEditing];
+  [field setBackgroundColor:[UIColor tertiarySystemBackgroundColor]];
+  field.layer.cornerRadius = 6;
+  self.field = field;
+
+  [_toolbarView setItems:@[
+    back, forward, reload,
+    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil],
+    [[UIBarButtonItem alloc] initWithCustomView:field],
+    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil],
+    self.tabsButton, self.historyButton
+  ]];
+
+  web::ShellWebClient* client =
+      static_cast<web::ShellWebClient*>(web::GetWebClient());
+  _browserState = client->browser_state();
+
+  web::WebState::CreateParams webStateCreateParams(_browserState);
+  _webState = web::WebState::Create(webStateCreateParams);
+
+  _webStateObserver = std::make_unique<web::WebStateObserverBridge>(self);
+  _webState->AddObserver(_webStateObserver.get());
+
+  _webStateDelegate = std::make_unique<web::WebStateDelegateBridge>(self);
+  _webState->SetDelegate(_webStateDelegate.get());
+
+  UIView* view = _webState->GetView();
+  [view setFrame:[_containerView bounds]];
+  [_containerView addSubview:view];
+  
+  // Enable web usage
+  _webState->SetWebUsageEnabled(true);
+}
+
+- (NavigationManager*)navigationManager {
+  return _webState->GetNavigationManager();
+}
+
+- (void)didReceiveMemoryWarning {
+  [super didReceiveMemoryWarning];
+}
+
+- (UIBarPosition)positionForBar:(id<UIBarPositioning>)bar {
+  if (bar == _toolbarView) {
+    return UIBarPositionTopAttached;
+  }
+  return UIBarPositionAny;
+}
+
+- (void)back {
+  if (self.navigationManager->CanGoBack()) {
+    self.navigationManager->GoBack();
+  }
+}
+
+- (void)forward {
+  if (self.navigationManager->CanGoForward()) {
+    self.navigationManager->GoForward();
+  }
+}
+
+- (void)reload {
+  self.navigationManager->Reload(ReloadType::NORMAL, false);
+}
+
+- (void)showTabs {
+  // Show tab picker - simplified for content_shell
+  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"CyberBrowser"
+                                                                   message:@"Tab management would be here in full build"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+  [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+  [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showHistory {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  NSArray *history = [defaults arrayForKey:@"cyberbrowser_history"] ?: @[];
+  
+  UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"History (%lu items)", (unsigned long)history.count]
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+  
+  for (NSDictionary *item in history) {
+    NSString *title = item[@"title"] ?: item[@"url"] ?: @"Unknown";
+    NSString *url = item[@"url"] ?: @"";
+    
+    [alert addAction:[UIAlertAction actionWithTitle:title
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+      GURL gurl([url UTF8String]);
+      if (gurl.is_valid()) {
+        NavigationManager::WebLoadParams params(gurl);
+        params.transition_type = ui::PAGE_TRANSITION_TYPED;
+        self.navigationManager->LoadURLWithParams(params);
+      }
+    }]];
+  }
+  
+  [alert addAction:[UIAlertAction actionWithTitle:@"Clear History"
+                                            style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *action) {
+    [defaults removeObjectForKey:@"cyberbrowser_history"];
+    [defaults synchronize];
+  }]];
+  
+  [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                            style:UIAlertActionStyleCancel
+                                          handler:nil]];
+  
+  [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField*)field {
+  GURL URL = GURL(base::SysNSStringToUTF8([field text]));
+
+  if (URL.is_valid()) {
+    NavigationManager::WebLoadParams params(URL);
+    params.transition_type = ui::PAGE_TRANSITION_TYPED;
+    self.navigationManager->LoadURLWithParams(params);
+  } else {
+    // Search with Google
+    NSString *encoded = [[field text] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    NSString *searchURL = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encoded];
+    GURL gurl([searchURL UTF8String]);
+    NavigationManager::WebLoadParams params(gurl);
+    params.transition_type = ui::PAGE_TRANSITION_GENERATED;
+    self.navigationManager->LoadURLWithParams(params);
+  }
+
+  [field resignFirstResponder];
+  [self updateToolbar];
+  return YES;
+}
+
+- (void)updateToolbar {
+  if ([_field isFirstResponder]) {
+    return;
+  }
+
+  const GURL& visibleURL = _webState->GetVisibleURL();
+  [_field setText:base::SysUTF8ToNSString(visibleURL.spec())];
+}
+
+// -----------------------------------------------------------------------
+#pragma mark Bikeshedding Implementation
+
+- (BOOL)canBecomeFirstResponder {
+  return YES;
+}
+
+- (void)motionEnded:(UIEventSubtype)motion withEvent:(UIEvent*)event {
+  if (event.subtype == UIEventSubtypeMotionShake) {
+    [self updateToolbarColor];
+  }
+}
+
+- (void)updateToolbarColor {
+  NSArray* colors = @[
+    [UIColor colorWithRed:0.1 green:0.1 blue:0.1 alpha:1.0],
+    [UIColor colorWithRed:0.337 green:0.467 blue:0.988 alpha:1.0],
+    [UIColor colorWithRed:0.898 green:0.110 blue:0.137 alpha:1.0],
+    [UIColor colorWithRed:0.376 green:0.490 blue:0.545 alpha:1.0],
+  ];
+
+  NSUInteger currentIndex = [colors indexOfObject:_toolbarView.barTintColor];
+  if (currentIndex == NSNotFound) currentIndex = 0;
+  _toolbarView.barTintColor = [colors objectAtIndex:(currentIndex + 1) % colors.count];
+}
+
+// -----------------------------------------------------------------------
+// WebStateObserver implementation.
+
+- (void)webState:(web::WebState*)webState
+    didStartNavigation:(web::NavigationContext*)navigation {
+  [self updateToolbar];
+  self.progressView.hidden = NO;
+}
+
+- (void)webState:(web::WebState*)webState
+    didFinishNavigation:(web::NavigationContext*)navigation {
+  [self updateToolbar];
+  self.progressView.hidden = YES;
+  self.progressView.progress = 1.0;
+  
+  // Store in history
+  const GURL& url = webState->GetVisibleURL();
+  if (url.is_valid()) {
+    NSString *urlStr = [NSString stringWithUTF8String:url.spec().c_str()];
+    const std::u16string &title = webState->GetTitle();
+    NSString *titleStr = title.empty() ? nil : [NSString stringWithCharacters:(const unichar *)title.data() length:title.length()];
+    StoreHistoryItem(urlStr, titleStr);
+  }
+}
+
+- (void)webState:(web::WebState*)webState didLoadPageWithSuccess:(BOOL)success {
+  DCHECK_EQ(_webState.get(), webState);
+  [self updateToolbar];
+  self.progressView.hidden = YES;
+}
+
+- (void)webState:(web::WebState*)webState
+    loadProgressChanged:(double)progress {
+  self.progressView.progress = progress;
+  self.progressView.hidden = NO;
+}
+
+- (void)webState:(web::WebState*)webState
+    didChangeBackForwardState:(web::WebState*)webState {
+  // Update button states
+}
+
+// -----------------------------------------------------------------------
+// WebStateDelegate implementation.
+
+- (void)webState:(web::WebState*)webView
+    contextMenuConfigurationForParams:(const web::ContextMenuParams&)params
+                    completionHandler:(void (^)(UIContextMenuConfiguration*))
+                                          completionHandler {
+  GURL link = params.link_url;
+  void (^copyHandler)(UIAction*) = ^(UIAction* action) {
+    NSDictionary* item = @{
+      UTTypeURL.identifier : net::NSURLWithGURL(link),
+      UTTypeUTF8PlainText.identifier : [base::SysUTF8ToNSString(link.spec())
+          dataUsingEncoding:NSUTF8StringEncoding],
+    };
+    [[UIPasteboard generalPasteboard] setItems:@[ item ]];
+  };
+
+  UIContextMenuConfiguration* configuration = [UIContextMenuConfiguration
+      configurationWithIdentifier:nil
+      previewProvider:^{
+        UIViewController* controller = [[UIViewController alloc] init];
+        CGRect frame = CGRectMake(10, 200, 200, 21);
+        UILabel* label = [[UILabel alloc] initWithFrame:frame];
+        label.text = @"CyberBrowser Preview";
+        [controller.view addSubview:label];
+        return controller;
+      }
+      actionProvider:^(id _) {
+        NSArray* actions = @[
+          [UIAction actionWithTitle:@"Copy Link"
+                              image:nil
+                         identifier:nil
+                            handler:copyHandler],
+          [UIAction actionWithTitle:@"Cancel"
+                              image:nil
+                         identifier:nil
+                            handler:^(id ignored){
+                            }]
+        ];
+        NSString* menuTitle = [NSString
+            stringWithFormat:@"CyberBrowser: %s", link.spec().c_str()];
+        return [UIMenu menuWithTitle:menuTitle children:actions];
+      }];
+
+  completionHandler(configuration);
+}
+
+- (void)webStateDestroyed:(web::WebState*)webState {
+  NOTREACHED();
+}
+
+@end

@@ -1,0 +1,210 @@
+name: Build CyberBrowser with Blink Engine
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      engine_type:
+        description: 'Chromium target to build'
+        required: true
+        default: 'ios_web_shell'
+        type: choice
+        options:
+          - ios_web_shell
+          - content_shell
+          - chrome_ios
+      enable_trollstore:
+        description: 'Create TrollStore TIPA'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  CHROMIUM_ROOT: ${{ github.workspace }}/chromium
+  DEPOT_TOOLS: ${{ github.workspace }}/chromium/depot_tools
+  SRC_DIR: ${{ github.workspace }}/chromium/src
+  OUTPUT_DIR: ${{ github.workspace }}/build-output
+  TIPACREATOR_DIR: ${{ github.workspace }}/tipa-creator
+
+jobs:
+  build-chromium:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout CyberBrowser
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.1
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer
+
+      - name: Install Dependencies
+        run: |
+          brew install ninja || true
+          pip3 install requests  # For depot_tools
+
+      - name: Cache depot_tools
+        id: cache-depot-tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPOT_TOOLS }}
+          key: depot-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/build-blink.yml') }}
+
+      - name: Install depot_tools
+        if: steps.cache-depot-tools.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git ${{ env.DEPOT_TOOLS }}
+
+      - name: Add depot_tools to PATH
+        run: echo "${{ env.DEPOT_TOOLS }}" >> $GITHUB_PATH
+
+      - name: Cache Chromium Source
+        id: cache-chromium-src
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CHROMIUM_ROOT }}/.gclient
+            ${{ env.CHROMIUM_ROOT }}/.gclient_entries
+            ${{ env.SRC_DIR }}
+            !${{ env.SRC_DIR }}/out
+          key: chromium-src-${{ runner.os }}-${{ hashFiles('.github/workflows/build-blink.yml') }}
+
+      - name: Fetch Chromium iOS Source
+        if: steps.cache-chromium-src.outputs.cache-hit != 'true'
+        run: |
+          echo "Fetching Chromium iOS source..."
+          mkdir -p ${{ env.CHROMIUM_ROOT }}
+          cd ${{ env.CHROMIUM_ROOT }}
+          fetch --nohooks ios
+
+      - name: Sync Chromium Source
+        run: |
+          cd ${{ env.SRC_DIR }}
+          gclient sync
+
+      - name: Install Build Dependencies
+        run: |
+          cd ${{ env.SRC_DIR }}
+          ./build/install-build-deps-ios.sh || true
+
+      - name: Run gclient hooks
+        run: |
+          cd ${{ env.SRC_DIR }}
+          gclient runhooks
+
+      - name: Apply CyberBrowser Patches
+        run: |
+          cd ${{ env.SRC_DIR }}
+          echo "Applying CyberBrowser patches..."
+          
+          # Backup original files
+          cp ios/web/shell/view_controller.mm ios/web/shell/view_controller.mm.bak || true
+          cp ios/web/shell/app_delegate.mm ios/web/shell/app_delegate.mm.bak || true
+          
+          # Copy our patched view controller
+          cp ${{ github.workspace }}/patches/CyberBrowserViewController.mm.patch ios/web/shell/view_controller.mm
+          
+          echo "Patches applied"
+
+      - name: Configure Build
+        run: |
+          cd ${{ env.SRC_DIR }}
+          mkdir -p out/CyberBrowser-Release
+          
+          cat > out/CyberBrowser-Release/args.gn << 'EOF'
+          is_debug = false
+          is_component_build = false
+          ios_enable_code_signing = false
+          ios_deployment_target = "15.0"
+          target_os = "ios"
+          target_cpu = "arm64"
+          use_blink = true
+          v8_use_external_startup_data = false
+          enable_ios_webview = true
+          symbol_level = 0
+          strip_debug_info = true
+          dcheck_always_on = false
+          EOF
+          
+          gn gen out/CyberBrowser-Release
+
+      - name: Build ios_web_shell
+        run: |
+          cd ${{ env.SRC_DIR }}
+          echo "Building ios_web_shell (this takes hours)..."
+          autoninja -C out/CyberBrowser-Release ios_web_shell
+
+      - name: Package CyberBrowser App
+        run: |
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          
+          if [ -d "${{ env.SRC_DIR }}/out/CyberBrowser-Release/ios_web_shell.app" ]; then
+            echo "Found ios_web_shell.app, packaging..."
+            
+            # Rename to CyberBrowser.app
+            cp -R "${{ env.SRC_DIR }}/out/CyberBrowser-Release/ios_web_shell.app" "${{ env.OUTPUT_DIR }}/CyberBrowser.app"
+            
+            # Update Info.plist bundle name
+            /usr/libexec/PlistBuddy -c "Set :CFBundleName CyberBrowser" "${{ env.OUTPUT_DIR }}/CyberBrowser.app/Info.plist" || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName CyberBrowser" "${{ env.OUTPUT_DIR }}/CyberBrowser.app/Info.plist" || true
+            
+            echo "Packaged: ${{ env.OUTPUT_DIR }}/CyberBrowser.app"
+            ls -la ${{ env.OUTPUT_DIR }}/CyberBrowser.app/
+          else
+            echo "ERROR: ios_web_shell.app not found"
+            ls -la ${{ env.SRC_DIR }}/out/CyberBrowser-Release/
+            exit 1
+          fi
+
+      - name: Build TIPA for TrollStore
+        if: ${{ inputs.enable_trollstore || github.event_name == 'push' }}
+        run: |
+          mkdir -p ${{ env.TIPACREATOR_DIR }}
+          cd ${{ env.TIPACREATOR_DIR }}
+          
+          # Clone tipa-creator
+          git clone --depth=1 https://github.com/fomri/tipa-creator.git . 2>/dev/null || true
+          
+          # Create TIPA from CyberBrowser.app
+          mkdir -p Payload
+          cp -R ${{ env.OUTPUT_DIR }}/CyberBrowser.app Payload/
+          
+          # Create .tipa (same as .ipa but renamed)
+          zip -r ${{ env.OUTPUT_DIR }}/CyberBrowser.tipa Payload
+          
+          # Also create regular .ipa
+          cp ${{ env.OUTPUT_DIR }}/CyberBrowser.tipa ${{ env.OUTPUT_DIR }}/CyberBrowser.ipa
+          
+          echo "TIPA created: ${{ env.OUTPUT_DIR }}/CyberBrowser.tipa"
+          echo "IPA created: ${{ env.OUTPUT_DIR }}/CyberBrowser.ipa"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyberbrowser-build
+          path: |
+            ${{ env.OUTPUT_DIR }}/CyberBrowser.app
+            ${{ env.OUTPUT_DIR }}/CyberBrowser.tipa
+            ${{ env.OUTPUT_DIR }}/CyberBrowser.ipa
+          retention-days: 7
+
+      - name: Upload Release Assets
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: blink-${{ github.run_number }}
+          name: CyberBrowser Blink Build ${{ github.run_number }}
+          body: |
+            CyberBrowser with Chromium Blink engine (ios_web_shell)
+            
+            **Files:**
+            - `CyberBrowser.tipa` - Install with TrollStore on iOS 15+
+            - `CyberBrowser.ipa` - Sideload with AltStore/SideStore
+            
+            **Note:** This build uses the real Chromium ios_web_shell with CyberBrowser patches for tabs, address bar, history, and Google search.
+          files: |
+            ${{ env.OUTPUT_DIR }}/CyberBrowser.tipa
+            ${{ env.OUTPUT_DIR }}/CyberBrowser.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
