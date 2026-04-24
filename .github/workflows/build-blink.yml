@@ -120,6 +120,7 @@ jobs:
           ios_deployment_target = "15.0"
           target_os = "ios"
           target_cpu = "arm64"
+          target_environment = "device"
           v8_use_external_startup_data = false
           symbol_level = 0
           strip_debug_info = true
