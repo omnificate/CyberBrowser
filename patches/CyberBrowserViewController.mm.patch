@@ -1,6 +1,6 @@
-// CyberBrowserViewController.mm
-// Replaces ios/web/shell/view_controller.mm with custom tabbed browser UI
-// This file is copied into the Chromium source tree during build
+// Copyright 2014 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #import "ios/web/shell/view_controller.h"
 
@@ -37,20 +37,10 @@ using web::NavigationManager;
   std::unique_ptr<web::WebState> _webState;
   std::unique_ptr<web::WebStateObserverBridge> _webStateObserver;
   std::unique_ptr<web::WebStateDelegateBridge> _webStateDelegate;
+  UIProgressView* _progressView;
 }
-
 @property(nonatomic, assign, readonly) NavigationManager* navigationManager;
 @property(nonatomic, readwrite, strong) UITextField* field;
-
-// CyberBrowser additions
-@property(nonatomic, strong) NSMutableArray<NSString*>* tabURLs;
-@property(nonatomic, assign) NSInteger currentTabIndex;
-@property(nonatomic, strong) UIToolbar* tabToolbar;
-@property(nonatomic, strong) UISegmentedControl* tabSwitcher;
-@property(nonatomic, strong) UIBarButtonItem* newTabButton;
-@property(nonatomic, strong) UIBarButtonItem* historyButton;
-@property(nonatomic, strong) UIProgressView* progressView;
-
 @end
 
 @implementation ViewController
@@ -102,13 +92,6 @@ using web::NavigationManager;
       UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   [self.view addSubview:_containerView];
 
-  // Set up the tab toolbar.
-  _tabToolbar = [[UIToolbar alloc] init];
-  _tabToolbar.barTintColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.08 alpha:1.0];
-  _tabToolbar.frame = CGRectMake(0, CGRectGetHeight(bounds) - 44, CGRectGetWidth(bounds), 44);
-  _tabToolbar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-  [self.view addSubview:_tabToolbar];
-
   // Set up the toolbar buttons.
   UIBarButtonItem* back = [[UIBarButtonItem alloc]
       initWithImage:[UIImage imageNamed:@"toolbar_back"]
@@ -147,60 +130,9 @@ using web::NavigationManager;
     back, forward, [[UIBarButtonItem alloc] initWithCustomView:field]
   ]];
 
-  // Set up tab management
-  _tabURLs = [NSMutableArray array];
-  _currentTabIndex = -1;
-
-  // New Tab button
-  _newTabButton = [[UIBarButtonItem alloc] initWithTitle:@"+"
-                                                      style:UIBarButtonItemStylePlain
-                                                     target:self
-                                                     action:@selector(newTab)];
-  [_newTabButton setTintColor:[UIColor whiteColor]];
-
-  // History button
-  _historyButton = [[UIBarButtonItem alloc] initWithTitle:@"History"
-                                                       style:UIBarButtonItemStylePlain
-                                                      target:self
-                                                      action:@selector(showHistory)];
-  [_historyButton setTintColor:[UIColor whiteColor]];
-
-  UIBarButtonItem* reload = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
-                                                                          target:self
-                                                                          action:@selector(reloadPage)];
-  [reload setTintColor:[UIColor whiteColor]];
-
-  UIBarButtonItem* stop = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemStop
-                                                                          target:self
-                                                                          action:@selector(stopLoading)];
-  [stop setTintColor:[UIColor whiteColor]];
-
-  UIBarButtonItem* home = [[UIBarButtonItem alloc] initWithTitle:@"Home"
-                                                            style:UIBarButtonItemStylePlain
-                                                           target:self
-                                                           action:@selector(goHome)];
-  [home setTintColor:[UIColor whiteColor]];
-
-  UIBarButtonItem* flexSpace = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
-                                                                               target:nil
-                                                                               action:nil];
-
-  [_tabToolbar setItems:@[_newTabButton, flexSpace, _historyButton, flexSpace, home, flexSpace, reload, flexSpace, stop]];
-
   web::ShellWebClient* client =
       static_cast<web::ShellWebClient*>(web::GetWebClient());
   _browserState = client->browser_state();
-
-  // Create initial tab with Google
-  [self newTab];
-  [self loadURL:GURL("https://www.google.com")];
-}
-
-- (void)createWebState {
-  if (_webState) {
-    _webState->RemoveObserver(_webStateObserver.get());
-    _webState.reset();
-  }
 
   web::WebState::CreateParams webStateCreateParams(_browserState);
   _webState = web::WebState::Create(webStateCreateParams);
@@ -214,6 +146,12 @@ using web::NavigationManager;
   UIView* view = _webState->GetView();
   [view setFrame:[_containerView bounds]];
   [_containerView addSubview:view];
+
+  // Load Google as homepage
+  GURL googleURL("https://www.google.com");
+  NavigationManager::WebLoadParams params(googleURL);
+  params.transition_type = ui::PAGE_TRANSITION_TYPED;
+  self.navigationManager->LoadURLWithParams(params);
 }
 
 - (NavigationManager*)navigationManager {
@@ -235,119 +173,6 @@ using web::NavigationManager;
   return UIBarPositionAny;
 }
 
-#pragma mark - Tab Management
-
-- (void)newTab {
-  if (_webState) {
-    // Save current URL before switching
-    const GURL& currentURL = _webState->GetVisibleURL();
-    if (currentURL.is_valid() && _currentTabIndex >= 0 && _currentTabIndex < [_tabURLs count]) {
-      _tabURLs[_currentTabIndex] = base::SysUTF8ToNSString(currentURL.spec());
-    }
-  }
-
-  [_tabURLs addObject:@"https://www.google.com"];
-  _currentTabIndex = [_tabURLs count] - 1;
-  [self createWebState];
-  [self loadURL:GURL("https://www.google.com")];
-  [self updateToolbar];
-}
-
-- (void)loadURL:(const GURL&)url {
-  if (!url.is_valid())
-    return;
-
-  NavigationManager::WebLoadParams params(url);
-  params.transition_type = ui::PAGE_TRANSITION_TYPED;
-  self.navigationManager->LoadURLWithParams(params);
-
-  [self storeHistoryItem:url.spec() title:@""];
-}
-
-- (void)storeHistoryItem:(const std::string&)url title:(NSString*)title {
-  if (url.empty()) return;
-
-  NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-  NSMutableArray* history = [[defaults arrayForKey:@"CyberBrowserHistory"] mutableCopy];
-  if (!history) {
-    history = [NSMutableArray array];
-  }
-
-  NSString* urlString = base::SysUTF8ToNSString(url);
-  NSDictionary* item = @{
-    @"url": urlString,
-    @"title": title ?: @"",
-    @"timestamp": [NSDate date]
-  };
-  [history addObject:item];
-
-  // Keep last 1000 items
-  if ([history count] > 1000) {
-    [history removeObjectsAtRange:NSMakeRange(0, [history count] - 1000)];
-  }
-
-  [defaults setObject:history forKey:@"CyberBrowserHistory"];
-  [defaults synchronize];
-}
-
-- (void)showHistory {
-  NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-  NSArray* history = [defaults arrayForKey:@"CyberBrowserHistory"];
-
-  UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"History"
-                                                                 message:nil
-                                                          preferredStyle:UIAlertControllerStyleActionSheet];
-
-  if ([history count] == 0) {
-    [alert addAction:[UIAlertAction actionWithTitle:@"No history yet"
-                                              style:UIAlertActionStyleDefault
-                                            handler:nil]];
-  } else {
-    // Show last 20 items
-    NSInteger count = MIN([history count], 20);
-    for (NSInteger i = [history count] - 1; i >= [history count] - count; i--) {
-      NSDictionary* item = history[i];
-      NSString* urlString = item[@"url"];
-      NSString* displayTitle = item[@"title"];
-      if ([displayTitle length] == 0) {
-        displayTitle = urlString;
-      }
-      [alert addAction:[UIAlertAction actionWithTitle:displayTitle
-                                                style:UIAlertActionStyleDefault
-                                              handler:^(UIAlertAction* action) {
-        [self loadURL:GURL(base::SysNSStringToUTF8(urlString))];
-      }]];
-    }
-  }
-
-  [alert addAction:[UIAlertAction actionWithTitle:@"Clear History"
-                                            style:UIAlertActionStyleDestructive
-                                          handler:^(UIAlertAction* action) {
-    [defaults removeObjectForKey:@"CyberBrowserHistory"];
-    [defaults synchronize];
-  }]];
-
-  [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                            style:UIAlertActionStyleCancel
-                                          handler:nil]];
-
-  [self presentViewController:alert animated:YES completion:nil];
-}
-
-- (void)goHome {
-  [self loadURL:GURL("https://www.google.com")];
-}
-
-- (void)reloadPage {
-  _webState->GetNavigationManager()->Reload(web::ReloadType::NORMAL, false);
-}
-
-- (void)stopLoading {
-  _webState->Stop();
-}
-
-#pragma mark - Navigation
-
 - (void)back {
   if (self.navigationManager->CanGoBack()) {
     self.navigationManager->GoBack();
@@ -360,16 +185,12 @@ using web::NavigationManager;
   }
 }
 
-#pragma mark - Text Field Delegate
-
 - (BOOL)textFieldShouldReturn:(UITextField*)field {
   NSString* text = [field text];
   GURL URL;
 
-  // Check if it's a search query or URL
   if ([text rangeOfString:@" "].location != NSNotFound ||
       [text rangeOfString:@"."].location == NSNotFound) {
-    // It's a search query - use Google
     NSString* encodedQuery = [text stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
     NSString* googleURL = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encodedQuery];
     URL = GURL(base::SysNSStringToUTF8(googleURL));
@@ -393,6 +214,7 @@ using web::NavigationManager;
 }
 
 - (void)updateToolbar {
+  // Do not update the URL if the text field is currently being edited.
   if ([_field isFirstResponder]) {
     return;
   }
@@ -401,8 +223,11 @@ using web::NavigationManager;
   [_field setText:base::SysUTF8ToNSString(visibleURL.spec())];
 }
 
-#pragma mark - Bikeshedding Implementation
+// -----------------------------------------------------------------------
+#pragma mark Bikeshedding Implementation
 
+// Overridden to allow this view controller to receive motion events by being
+// first responder when no other views are.
 - (BOOL)canBecomeFirstResponder {
   return YES;
 }
@@ -414,24 +239,43 @@ using web::NavigationManager;
 }
 
 - (void)updateToolbarColor {
+  // Cycle through the following set of colors:
   NSArray* colors = @[
+    // CyberBrowser Dark.
     [UIColor colorWithRed:0.05 green:0.05 blue:0.05 alpha:1.0],
+    // Vanilla Red.
     [UIColor colorWithRed:0.898 green:0.110 blue:0.137 alpha:1.0],
+    // Blue Grey.
     [UIColor colorWithRed:0.376 green:0.490 blue:0.545 alpha:1.0],
+    // Brown.
     [UIColor colorWithRed:0.475 green:0.333 blue:0.282 alpha:1.0],
+    // Purple.
     [UIColor colorWithRed:0.612 green:0.153 blue:0.690 alpha:1.0],
+    // Teal.
+    [UIColor colorWithRed:0.000 green:0.737 blue:0.831 alpha:1.0],
+    // Deep Orange.
+    [UIColor colorWithRed:1.000 green:0.341 blue:0.133 alpha:1.0],
+    // Indigo.
+    [UIColor colorWithRed:0.247 green:0.318 blue:0.710 alpha:1.0],
+    // Vanilla Green.
+    [UIColor colorWithRed:0.145 green:0.608 blue:0.141 alpha:1.0],
+    // Pinkerton.
+    [UIColor colorWithRed:0.914 green:0.118 blue:0.388 alpha:1.0],
   ];
 
   NSUInteger currentIndex = [colors indexOfObject:_toolbarView.barTintColor];
   if (currentIndex == NSNotFound) {
     currentIndex = 0;
   }
-  NSUInteger newIndex = (currentIndex + 1) % [colors count];
+  NSUInteger newIndex = currentIndex + 1;
+  if (newIndex >= [colors count]) {
+    newIndex = 0;
+  }
   _toolbarView.barTintColor = [colors objectAtIndex:newIndex];
-  _tabToolbar.barTintColor = [colors objectAtIndex:newIndex];
 }
 
-#pragma mark - WebStateObserver
+// -----------------------------------------------------------------------
+// WebStateObserver implementation.
 
 - (void)webState:(web::WebState*)webState
     didStartNavigation:(web::NavigationContext*)navigation {
@@ -447,11 +291,6 @@ using web::NavigationManager;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
     [self->_progressView setProgress:0.0 animated:NO];
   });
-
-  // Store history with title
-  const GURL& url = webState->GetVisibleURL();
-  NSString* title = base::SysUTF8ToNSString(webState->GetTitle());
-  [self storeHistoryItem:url.spec() title:title];
 }
 
 - (void)webState:(web::WebState*)webState didLoadPageWithSuccess:(BOOL)success {
@@ -463,7 +302,8 @@ using web::NavigationManager;
   [_progressView setProgress:progress animated:YES];
 }
 
-#pragma mark - WebStateDelegate
+// -----------------------------------------------------------------------
+// WebStateDelegate implementation.
 
 - (void)webState:(web::WebState*)webView
     contextMenuConfigurationForParams:(const web::ContextMenuParams&)params
@@ -480,12 +320,9 @@ using web::NavigationManager;
   };
 
   void (^openHandler)(UIAction*) = ^(UIAction* action) {
-    [self loadURL:link];
-  };
-
-  void (^newTabHandler)(UIAction*) = ^(UIAction* action) {
-    [self newTab];
-    [self loadURL:link];
+    NavigationManager::WebLoadParams params(link);
+    params.transition_type = ui::PAGE_TRANSITION_TYPED;
+    self.navigationManager->LoadURLWithParams(params);
   };
 
   UIContextMenuConfiguration* configuration = [UIContextMenuConfiguration
@@ -504,10 +341,6 @@ using web::NavigationManager;
                               image:nil
                          identifier:nil
                             handler:openHandler],
-          [UIAction actionWithTitle:@"Open in New Tab"
-                              image:nil
-                         identifier:nil
-                            handler:newTabHandler],
           [UIAction actionWithTitle:@"Copy Link"
                               image:nil
                          identifier:nil
@@ -527,6 +360,9 @@ using web::NavigationManager;
 }
 
 - (void)webStateDestroyed:(web::WebState*)webState {
+  // The WebState is owned by the current instance, and the observer bridge
+  // is unregistered before the WebState is destroyed, so this event should
+  // never happen.
   NOTREACHED();
 }
 
